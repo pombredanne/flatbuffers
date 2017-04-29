@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <string>
 #include <sstream>
+#include <stdint.h>
 #include <stdlib.h>
 #include <assert.h>
 #ifdef _WIN32
@@ -34,9 +35,13 @@
 #include <winbase.h>
 #include <direct.h>
 #else
-#include <sys/stat.h>
 #include <limits.h>
 #endif
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#include "flatbuffers/flatbuffers.h"
+
 
 namespace flatbuffers {
 
@@ -68,7 +73,7 @@ template<> inline std::string NumToString<double>(double t) {
   auto p = s.find_last_not_of('0');
   if (p != std::string::npos) {
     s.resize(p + 1);  // Strip trailing zeroes.
-    if (s.back() == '.')
+    if (s[s.size() - 1] == '.')
       s.erase(s.size() - 1, 1);  // Strip '.' if a whole number.
   }
   return s;
@@ -91,50 +96,46 @@ inline std::string IntToStringHex(int i, int xdigits) {
 }
 
 // Portable implementation of strtoll().
-inline int64_t StringToInt(const char *str, int base = 10) {
+inline int64_t StringToInt(const char *str, char **endptr = nullptr,
+                           int base = 10) {
   #ifdef _MSC_VER
-    return _strtoi64(str, nullptr, base);
+    return _strtoi64(str, endptr, base);
   #else
-    return strtoll(str, nullptr, base);
+    return strtoll(str, endptr, base);
   #endif
 }
 
 // Portable implementation of strtoull().
-inline int64_t StringToUInt(const char *str, int base = 10) {
+inline uint64_t StringToUInt(const char *str, char **endptr = nullptr,
+                             int base = 10) {
   #ifdef _MSC_VER
-    return _strtoui64(str, nullptr, base);
+    return _strtoui64(str, endptr, base);
   #else
-    return strtoull(str, nullptr, base);
+    return strtoull(str, endptr, base);
   #endif
 }
 
+typedef bool (*LoadFileFunction)(const char *filename, bool binary,
+                                 std::string *dest);
+typedef bool (*FileExistsFunction)(const char *filename);
+
+LoadFileFunction SetLoadFileFunction(LoadFileFunction load_file_function);
+
+FileExistsFunction SetFileExistsFunction(FileExistsFunction
+                                         file_exists_function);
+
+
 // Check if file "name" exists.
-inline bool FileExists(const char *name) {
-  std::ifstream ifs(name);
-  return ifs.good();
-}
+bool FileExists(const char *name);
+
+// Check if "name" exists and it is also a directory.
+bool DirExists(const char *name);
 
 // Load file "name" into "buf" returning true if successful
 // false otherwise.  If "binary" is false data is read
 // using ifstream's text mode, otherwise data is read with
 // no transcoding.
-inline bool LoadFile(const char *name, bool binary, std::string *buf) {
-  std::ifstream ifs(name, binary ? std::ifstream::binary : std::ifstream::in);
-  if (!ifs.is_open()) return false;
-  if (binary) {
-    // The fastest way to read a file into a string.
-    ifs.seekg(0, std::ios::end);
-    (*buf).resize(static_cast<size_t>(ifs.tellg()));
-    ifs.seekg(0, std::ios::beg);
-    ifs.read(&(*buf)[0], (*buf).size());
-  } else {
-    // This is slower, but works correctly on all platforms for text files.
-    std::ostringstream oss;
-    oss << ifs.rdbuf();
-    *buf = oss.str();
-  }
-  return !ifs.bad();
-}
+bool LoadFile(const char *name, bool binary, std::string *buf);
 
 // Save data "buf" of length "len" bytes into a file
 // "name" returning true if successful, false otherwise.
@@ -197,8 +198,8 @@ inline std::string StripFileName(const std::string &filepath) {
 inline std::string ConCatPathFileName(const std::string &path,
                                       const std::string &filename) {
   std::string filepath = path;
-  if (path.length() && path.back() != kPathSeparator &&
-                       path.back() != kPosixPathSeparator)
+  if (path.length() && path[path.size() - 1] != kPathSeparator &&
+                       path[path.size() - 1] != kPosixPathSeparator)
     filepath += kPathSeparator;
   filepath += filename;
   return filepath;
@@ -210,7 +211,7 @@ inline void EnsureDirExists(const std::string &filepath) {
   auto parent = StripFileName(filepath);
   if (parent.length()) EnsureDirExists(parent);
   #ifdef _WIN32
-    _mkdir(filepath.c_str());
+    (void)_mkdir(filepath.c_str());
   #else
     mkdir(filepath.c_str(), S_IRWXU|S_IRGRP|S_IXGRP);
   #endif
@@ -219,15 +220,19 @@ inline void EnsureDirExists(const std::string &filepath) {
 // Obtains the absolute path from any other path.
 // Returns the input path if the absolute path couldn't be resolved.
 inline std::string AbsolutePath(const std::string &filepath) {
-  #ifdef _WIN32
-    char abs_path[MAX_PATH];
-    return GetFullPathNameA(filepath.c_str(), MAX_PATH, abs_path, nullptr)
+  #ifdef FLATBUFFERS_NO_ABSOLUTE_PATH_RESOLUTION
+    return filepath;
   #else
-    char abs_path[PATH_MAX];
-    return realpath(filepath.c_str(), abs_path)
-  #endif
-    ? abs_path
-    : filepath;
+    #ifdef _WIN32
+      char abs_path[MAX_PATH];
+      return GetFullPathNameA(filepath.c_str(), MAX_PATH, abs_path, nullptr)
+    #else
+      char abs_path[PATH_MAX];
+      return realpath(filepath.c_str(), abs_path)
+    #endif
+      ? abs_path
+      : filepath;
+  #endif // FLATBUFFERS_NO_ABSOLUTE_PATH_RESOLUTION
 }
 
 // To and from UTF-8 unicode conversion functions
@@ -274,12 +279,42 @@ inline int FromUTF8(const char **in) {
   }
   if ((**in << len) & 0x80) return -1;  // Bit after leading 1's must be 0.
   if (!len) return *(*in)++;
+  // UTF-8 encoded values with a length are between 2 and 4 bytes.
+  if (len < 2 || len > 4) {
+    return -1;
+  }
   // Grab initial bits of the code.
   int ucc = *(*in)++ & ((1 << (7 - len)) - 1);
   for (int i = 0; i < len - 1; i++) {
     if ((**in & 0xC0) != 0x80) return -1;  // Upper bits must 1 0.
     ucc <<= 6;
     ucc |= *(*in)++ & 0x3F;  // Grab 6 more bits of the code.
+  }
+  // UTF-8 cannot encode values between 0xD800 and 0xDFFF (reserved for
+  // UTF-16 surrogate pairs).
+  if (ucc >= 0xD800 && ucc <= 0xDFFF) {
+    return -1;
+  }
+  // UTF-8 must represent code points in their shortest possible encoding.
+  switch (len) {
+    case 2:
+      // Two bytes of UTF-8 can represent code points from U+0080 to U+07FF.
+      if (ucc < 0x0080 || ucc > 0x07FF) {
+        return -1;
+      }
+      break;
+    case 3:
+      // Three bytes of UTF-8 can represent code points from U+0800 to U+FFFF.
+      if (ucc < 0x0800 || ucc > 0xFFFF) {
+        return -1;
+      }
+      break;
+    case 4:
+      // Four bytes of UTF-8 can represent code points from U+10000 to U+10FFFF.
+      if (ucc < 0x10000 || ucc > 0x10FFFF) {
+        return -1;
+      }
+      break;
   }
   return ucc;
 }
